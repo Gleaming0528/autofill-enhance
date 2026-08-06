@@ -8,8 +8,10 @@
 
   var TAG = '[AutoFill]';
   var OTP_RE = /安全码|验证码|校验码|动态码|口令|otp|totp|mfa|2fa|security.?code|verif|one.?time|auth.?code|token/i;
-  var DIGIT_RE = /^\d{4,8}$/;
-  var BLOCKED_AC = { off: 1, 'false': 1, nope: 1, disabled: 1, 'new-password': 1 };
+  // 剪贴板自动填充仅匹配 6 位数字，避免误填 PIN / 年份；更长或更短的码走手动粘贴。
+  var CLIP_RE = /^\d{6}$/;
+  // new-password 是合法提示（注册页防误填），不在此拦截。
+  var BLOCKED_AC = { off: 1, 'false': 1, nope: 1, disabled: 1 };
   var nativeSet = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
   var nativeGet = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').get;
   var processed = new WeakSet();
@@ -25,6 +27,29 @@
     el.dispatchEvent(new Event('change', { bubbles: true }));
   }
 
+  // ==================== label 关联 ====================
+  // 优先取 label[for=id] 精确绑定的文案；其次取最近一层具体 form-item 容器的 label。
+  // 不使用 [class*="form"] 宽泛匹配，避免把同表单的手机号等字段误判为验证码。
+  function labelFor(el) {
+    if (el.id) {
+      try {
+        var esc = (window.CSS && CSS.escape) ? CSS.escape(el.id) : el.id;
+        var bound = el.ownerDocument.querySelector('label[for="' + esc + '"]');
+        if (bound) return bound.textContent;
+      } catch (e) {}
+    }
+    var WRAPPERS = ['.next-form-item', '.ant-form-item', '.form-group', '.form-item'];
+    for (var i = 0; i < WRAPPERS.length; i++) {
+      try {
+        var item = el.closest(WRAPPERS[i]);
+        if (!item) continue;
+        var lab = item.querySelector('label');
+        if (lab) return lab.textContent;
+      } catch (e) {}
+    }
+    return '';
+  }
+
   function isOtpField(el) {
     if (el.tagName !== 'INPUT') return false;
     var t = (el.type || 'text').toLowerCase();
@@ -33,19 +58,28 @@
       el.getAttribute('placeholder'),
       el.getAttribute('name'),
       el.getAttribute('id'),
-      el.getAttribute('aria-label')
+      el.getAttribute('aria-label'),
+      labelFor(el)
     ];
-    try { hints.push(el.closest('.next-form-item').querySelector('label').textContent); } catch (e) {}
-    try { hints.push(el.closest('.form-group').querySelector('label').textContent); } catch (e) {}
-    try { hints.push(el.closest('.form-item').querySelector('label').textContent); } catch (e) {}
-    try { hints.push(el.closest('[class*="form"]').querySelector('label').textContent); } catch (e) {}
     return OTP_RE.test(hints.filter(Boolean).join(' '));
   }
 
+  // 所在表单含密码框 → 视为登录/注册场景，允许解锁只读与粘贴。
+  function inAuthForm(el) {
+    try {
+      var form = el.form || el.closest('form');
+      return !!(form && form.querySelector('input[type="password"]'));
+    } catch (e) {
+      return false;
+    }
+  }
+
   // ==================== 粘贴拦截 ====================
+  // 仅对验证码字段接管粘贴（整值替换符合输入完整 OTP 的语义）。
+  // 普通输入框保留浏览器默认的「按光标插入」粘贴，避免清空已有内容。
   document.addEventListener('paste', function (e) {
     var el = e.target;
-    if (!el || el.tagName !== 'INPUT' || !processed.has(el)) return;
+    if (!el || el.tagName !== 'INPUT' || !otpFields.has(el)) return;
     var text = (e.clipboardData ? e.clipboardData.getData('text') : '').trim();
     if (!text) return;
     e.preventDefault();
@@ -76,17 +110,20 @@
 
       if (otp) {
         otpFields.add(el);
-        if (!el.name) el.setAttribute('name', 'otp');
         console.log(TAG, 'OTP 字段:', el.placeholder || el.name || '(unknown)');
         bindClipboardFill(el);
         watchExternalFill(el);
       }
 
-      el.removeAttribute('onpaste');
-      if (el.tagName === 'INPUT' && el.hasAttribute('readonly')) {
-        var t = (el.type || 'text').toLowerCase();
-        if (['text', 'password', 'email', 'tel', 'number'].indexOf(t) !== -1) {
-          el.removeAttribute('readonly');
+      // 只读 / 粘贴解锁只作用于验证码字段或登录表单，
+      // 避免误伤日期选择器、只读金额展示等正常组件。
+      if (otp || inAuthForm(el)) {
+        el.removeAttribute('onpaste');
+        if (el.tagName === 'INPUT' && el.hasAttribute('readonly')) {
+          var t = (el.type || 'text').toLowerCase();
+          if (['text', 'password', 'email', 'tel', 'number'].indexOf(t) !== -1) {
+            el.removeAttribute('readonly');
+          }
         }
       }
     }
@@ -105,7 +142,7 @@
       if (!navigator.clipboard || !navigator.clipboard.readText) return;
       navigator.clipboard.readText().then(function (text) {
         text = (text || '').trim();
-        if (DIGIT_RE.test(text)) {
+        if (CLIP_RE.test(text)) {
           forceUpdate(input, text);
           console.log(TAG, '剪贴板自动填入', text.length + ' 位');
         }
@@ -115,15 +152,25 @@
 
   // ==================== 监听外部填充（Bitwarden 等） ====================
   // 密码管理器填值后，框架可能重置。轮询捕获并用 forceUpdate 固定。
+  // 聚焦时视为用户正在键入，不重复派发事件；值稳定约 2 秒后停止该字段轮询。
   function watchExternalFill(input) {
     var lastSeen = '';
+    var stable = 0;
     var tick = setInterval(function () {
       var cur = nativeGet.call(input);
-      if (cur && cur !== lastSeen) {
-        lastSeen = cur;
-        forceUpdate(input, cur);
-          console.log(TAG, '外部填充已固定', cur.length + ' 位');
+      if (!cur) {
+        stable = 0;
+        return;
       }
+      if (cur === lastSeen) {
+        if (++stable >= 25) clearInterval(tick);
+        return;
+      }
+      lastSeen = cur;
+      stable = 0;
+      if (document.activeElement === input) return;
+      forceUpdate(input, cur);
+      console.log(TAG, '外部填充已固定', cur.length + ' 位');
     }, 80);
     setTimeout(function () { clearInterval(tick); }, 120000);
   }

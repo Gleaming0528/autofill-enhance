@@ -1,12 +1,19 @@
 {
   "manifest_version": 3,
   "name": "自动填充增强",
-  "version": "2.0",
+  "version": "2.1",
   "description": "让密码管理器能自动填充被网站阻止的 OTP/MFA 验证码字段",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
   "content_scripts": [{
     "matches": ["*://*/*"],
     "js": ["content.js"],
     "run_at": "document_end",
-    "world": "ISOLATED"
+    "world": "ISOLATED",
+    "all_frames": true
   }]
 }
