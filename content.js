@@ -21,8 +21,11 @@
   // ISOLATED world 无法访问 _valueTracker（页面 JS 上下文的自定义属性）。
   // 但 nativeSet 直接修改共享 DOM 值 → dispatchEvent 触发页面框架的事件监听
   // → 框架检测到 DOM 值与内部状态不一致 → 触发 onChange → 状态更新。
-  function forceUpdate(el, value) {
+  function forceUpdate(el, value, caret) {
     nativeSet.call(el, value);
+    if (typeof caret === 'number' && typeof el.setSelectionRange === 'function') {
+      try { el.setSelectionRange(caret, caret); } catch (e) {}
+    }
     el.dispatchEvent(new Event('input', { bubbles: true }));
     el.dispatchEvent(new Event('change', { bubbles: true }));
   }
@@ -75,7 +78,7 @@
   }
 
   // ==================== 粘贴拦截 ====================
-  // 仅对验证码字段接管粘贴（整值替换符合输入完整 OTP 的语义）。
+  // 仅对验证码字段接管粘贴，但仍按浏览器语义在光标处插入或替换选区。
   // 普通输入框保留浏览器默认的「按光标插入」粘贴，避免清空已有内容。
   document.addEventListener('paste', function (e) {
     var el = e.target;
@@ -84,7 +87,10 @@
     if (!text) return;
     e.preventDefault();
     e.stopImmediatePropagation();
-    forceUpdate(el, text);
+    var value = nativeGet.call(el);
+    var start = typeof el.selectionStart === 'number' ? el.selectionStart : value.length;
+    var end = typeof el.selectionEnd === 'number' ? el.selectionEnd : start;
+    forceUpdate(el, value.slice(0, start) + text + value.slice(end), start + text.length);
     console.log(TAG, '粘贴填入', text.length + ' 位');
   }, true);
 
